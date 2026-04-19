@@ -13,21 +13,22 @@
 #
 # Operating modes:
 # 工作模式：
-#   - Primary: OpenAI-compatible API (DeepSeek/Ollama/LM Studio/vLLM/Gemini etc.)
-#     主路径：通过 OpenAI 兼容客户端调用 LLM API
-#   - Fallback: local keyword extraction when API is unavailable
-#     备用路径：API 不可用时用本地关键词提取
+#   - API only: OpenAI-compatible API (DeepSeek/Ollama/LM Studio/vLLM/Gemini etc.)
+#     仅 API：通过 OpenAI 兼容客户端调用 LLM API
+#   - Dehydration cache: SQLite persistent cache to avoid redundant API calls
+#     脱水缓存：SQLite 持久缓存，避免重复调用 API
 #
 # Depended on by: server.py
 # 被谁依赖：server.py
 # ============================================================
 
 
+import os
 import re
 import json
+import hashlib
+import sqlite3
 import logging
-from collections import Counter
-import jieba
 
 from openai import AsyncOpenAI
 
@@ -171,8 +172,6 @@ class Dehydrator:
 
         # --- Initialize OpenAI-compatible client ---
         # --- 初始化 OpenAI 兼容客户端 ---
-        # Supports any OpenAI-format API: DeepSeek / Ollama / LM Studio / vLLM / Gemini etc.
-        # User only needs to set base_url in config.yaml
         if self.api_available:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
@@ -181,6 +180,57 @@ class Dehydrator:
             )
         else:
             self.client = None
+
+        # --- SQLite dehydration cache ---
+        # --- SQLite 脱水缓存：content hash → summary ---
+        db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
+        self.cache_db_path = db_path
+        self._init_cache_db()
+
+    def _init_cache_db(self):
+        """Create dehydration cache table if not exists."""
+        os.makedirs(os.path.dirname(self.cache_db_path), exist_ok=True)
+        conn = sqlite3.connect(self.cache_db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS dehydration_cache (
+                content_hash TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _get_cached_summary(self, content: str) -> str | None:
+        """Look up cached dehydration result by content hash."""
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        conn = sqlite3.connect(self.cache_db_path)
+        row = conn.execute(
+            "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
+            (content_hash,)
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def _set_cached_summary(self, content: str, summary: str):
+        """Store dehydration result in cache."""
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        conn = sqlite3.connect(self.cache_db_path)
+        conn.execute(
+            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
+            (content_hash, summary, self.model)
+        )
+        conn.commit()
+        conn.close()
+
+    def invalidate_cache(self, content: str):
+        """Remove cached summary for specific content (call when bucket content changes)."""
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        conn = sqlite3.connect(self.cache_db_path)
+        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
+        conn.commit()
+        conn.close()
 
     # ---------------------------------------------------------
     # Dehydrate: compress raw content into concise summary
@@ -192,8 +242,10 @@ class Dehydrator:
         """
         Dehydrate/compress memory content.
         Returns formatted summary string ready for Claude context injection.
+        Uses SQLite cache to avoid redundant API calls.
         对记忆内容做脱水压缩。
         返回格式化的摘要字符串，可直接注入 Claude 上下文。
+        使用 SQLite 缓存避免重复调用 API。
         """
         if not content or not content.strip():
             return "（空记忆 / empty memory）"
@@ -203,9 +255,20 @@ class Dehydrator:
         if count_tokens_approx(content) < 100:
             return self._format_output(content, metadata)
 
-        # --- Local compression (Always used as requested) ---
-        # --- 本地压缩 ---
-        result = self._local_dehydrate(content)
+        # --- Check cache first ---
+        # --- 先查缓存 ---
+        cached = self._get_cached_summary(content)
+        if cached:
+            return self._format_output(cached, metadata)
+
+        # --- API dehydration (no local fallback) ---
+        # --- API 脱水（无本地降级）---
+        if not self.api_available:
+            raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
+
+        result = await self._api_dehydrate(content)
+        # --- Cache the result ---
+        self._set_cached_summary(content, result)
         return self._format_output(result, metadata)
 
     # ---------------------------------------------------------
@@ -282,80 +345,7 @@ class Dehydrator:
             return ""
         return response.choices[0].message.content or ""
 
-    # ---------------------------------------------------------
-    # Local dehydration (fallback when API is unavailable)
-    # 本地脱水（无 API 时的兜底方案）
-    # Keyword frequency + sentence position weighting
-    # 基于关键词频率 + 句子位置权重
-    # ---------------------------------------------------------
-    def _local_dehydrate(self, content: str) -> str:
-        """
-        Local keyword extraction + position-weighted simple compression.
-        本地关键词提取 + 位置加权的简单压缩。
-        """
-        # --- Split into sentences / 分句 ---
-        sentences = re.split(r"[。！？\n.!?]+", content)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
 
-        if not sentences:
-            return content[:200]
-
-        # --- Extract high-frequency keywords / 提取高频关键词 ---
-        keywords = self._extract_keywords(content)
-
-        # --- Score sentences: position weight + keyword hits ---
-        # --- 句子评分：开头结尾权重高 + 关键词命中加分 ---
-        scored = []
-        for i, sent in enumerate(sentences):
-            position_weight = 1.5 if i < 3 else (1.2 if i > len(sentences) - 3 else 1.0)
-            keyword_hits = sum(1 for kw in keywords if kw in sent)
-            score = position_weight * (1 + keyword_hits)
-            scored.append((score, sent))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # --- Top-8 sentences + keyword list / 取高分句 + 关键词列表 ---
-        selected = [s for _, s in scored[:8]]
-        summary = "。".join(selected)
-        
-        if len(summary) > 1000:
-            summary = summary[:1000] + "…"
-        return summary
-
-    # ---------------------------------------------------------
-    # Keyword extraction
-    # 关键词提取
-    # Chinese + English tokenization → stopword filter → frequency sort
-    # 中英文分词 + 停用词过滤 + 词频排序
-    # ---------------------------------------------------------
-    def _extract_keywords(self, text: str) -> list[str]:
-        """
-        Extract high-frequency keywords using jieba (Chinese + English mixed).
-        用 jieba 分词提取高频关键词。
-        """
-        try:
-            words = jieba.lcut(text)
-        except Exception:
-            words = []
-        # English words / 英文单词
-        english_words = re.findall(r"[a-zA-Z]{3,}", text.lower())
-        words += english_words
-
-        # Stopwords / 停用词
-        stopwords = {
-            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
-            "都", "一个", "上", "也", "很", "到", "说", "要", "去",
-            "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "她",
-            "the", "and", "for", "are", "but", "not", "you", "all", "can",
-            "had", "her", "was", "one", "our", "out", "has", "have", "with",
-            "this", "that", "from", "they", "been", "said", "will", "each",
-        }
-        filtered = [
-            w for w in words
-            if w not in stopwords and len(w.strip()) > 1 and not re.match(r"^[0-9]+$", w)
-        ]
-        counter = Counter(filtered)
-        return [word for word, _ in counter.most_common(15)]
 
     # ---------------------------------------------------------
     # Output formatting

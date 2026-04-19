@@ -300,7 +300,7 @@ async def breath(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] {summary}")
+                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
                 continue
@@ -359,7 +359,7 @@ async def breath(
                     break
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
                 score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[权重:{score:.2f}] {summary}")
+                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
                 token_budget -= summary_tokens
             except Exception as e:
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
@@ -387,7 +387,7 @@ async def breath(
             results = []
             for f in feels:
                 created = f["metadata"].get("created", "")
-                entry = f"[{created}]\n{strip_wikilinks(f['content'])}"
+                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
                 results.append(entry)
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
@@ -453,7 +453,9 @@ async def breath(
                 break
             await bucket_mgr.touch(bucket["id"])
             if bucket.get("vector_match"):
-                summary = f"[语义关联] {summary}"
+                summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
+            else:
+                summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(summary)
             token_used += summary_tokens
         except Exception as e:
@@ -829,6 +831,7 @@ async def pulse(include_archive: bool = False) -> str:
         resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
         lines.append(
             f"{icon} [{meta.get('name', b['id'])}]{resolved_tag} "
+            f"bucket_id:{b['id']} "
             f"主题:{domains} "
             f"情感:V{val:.1f}/A{aro:.1f} "
             f"重要:{meta.get('importance', '?')} "
